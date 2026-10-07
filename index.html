@@ -831,6 +831,7 @@
             if (sequence !== manageLoadSequence || sheet !== manageDaySelector.value) return;
             manageEntries = data.entries;
             manageLoadedSheet = sheet;
+            studyNeedsRefresh = true;
             renderManageEntries(manageEntries);
             saveEntryBtn.disabled = false;
           } catch (error) {

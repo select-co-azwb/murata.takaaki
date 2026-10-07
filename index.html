@@ -149,6 +149,12 @@
       <button class="view-tab" id="manageTab" type="button" role="tab" aria-selected="false">Add &amp; Manage</button>
     </div>
 
+    <section id="connectionDiagnostics" hidden style="text-align:left;padding:12px;border:1px solid #aaa;border-radius:10px;margin:12px 0">
+      <strong>Connection check — Murata</strong>
+      <p>Requests stop after 15 seconds. This check records timing and response types, without vocabulary.</p>
+      <pre id="connectionLog" style="white-space:pre-wrap;font-size:13px"></pre>
+    </section>
+
     <section class="view-panel" id="studyView">
 
     <div>
@@ -620,20 +626,54 @@
           return (localStorage.getItem(BRIDGE_TOKEN_KEY) || '').trim();
         }
 
-        async function bridgeRequest(payload, attempt = 0) {
+        const CONNECTION_TIMEOUT_MS = 15000;
+        const connectionLog = document.getElementById('connectionLog');
+        const connectionDiagnostics = document.getElementById('connectionDiagnostics');
+        const showConnectionCheck = new URLSearchParams(location.search).get('diagnostics') === '1';
+        connectionDiagnostics.hidden = !showConnectionCheck;
+        const connectionEvents = [];
+        const connectionStarted = Date.now();
+        function recordConnection(action, phase, details = '') {
+          const line = ((Date.now() - connectionStarted) / 1000).toFixed(1) +
+            's | ' + action + ' | ' + phase + (details ? ' | ' + details : '');
+          connectionEvents.push(line);
+          if (connectionEvents.length > 30) connectionEvents.shift();
+          if (showConnectionCheck) connectionLog.textContent = connectionEvents.join('\n');
+          console.log('[Connection]', line);
+        }
+
+        async function bridgeRequest(payload) {
           const retryableActions = ['days', 'list', 'study'];
           const mayRetry = retryableActions.includes(payload.action);
-          const maxAttempts = mayRetry ? 3 : 1;
+          const controller = new AbortController();
+          let timedOut = false;
+          let serverRejected = false;
+          let deadline;
+          recordConnection(payload.action, 'request started');
+          const timeout = new Promise((_, reject) => {
+            deadline = setTimeout(() => {
+              timedOut = true;
+              controller.abort();
+              reject(new Error('Connection timed out after 15 seconds.'));
+            }, CONNECTION_TIMEOUT_MS);
+          });
 
           try {
-            const response = await fetch(BRIDGE_URL, {
+            const transfer = (async () => {
+              const response = await fetch(BRIDGE_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'text/plain;charset=utf-8' },
               body: JSON.stringify(payload),
-              cache: 'no-store'
+              cache: 'no-store',
+              signal: controller.signal
             });
-
-            const responseText = await response.text();
+              recordConnection(payload.action, 'response headers',
+                'HTTP ' + response.status + '; redirected=' + response.redirected);
+              const responseText = await response.text();
+              if (!response.ok) throw new Error('HTTP ' + response.status);
+              return responseText;
+            })();
+            const responseText = await Promise.race([transfer, timeout]);
             let data;
 
             try {
@@ -642,9 +682,12 @@
               throw new Error('The Bridge returned an unexpected response.');
             }
 
-            if (!data.ok) {
+            recordConnection(payload.action, 'reply parsed',
+              'action=' + (data && data.action || 'missing') + '; ok=' + Boolean(data && data.ok));
+            if (!data || !data.ok) {
+              serverRejected = Boolean(data && data.ok === false && typeof data.error === 'string');
               throw new Error(
-                data.error || 'The request could not be completed.'
+                data && data.error || 'The request could not be completed.'
               );
             }
 
@@ -686,14 +729,11 @@
               throw new Error('The Bridge did not confirm the change.');
             }
 
+            recordConnection(payload.action, 'confirmed');
             return data;
           } catch (error) {
-            if (attempt + 1 < maxAttempts) {
-              const delay = 750 * (attempt + 1);
-              await new Promise((resolve) => setTimeout(resolve, delay));
-              return bridgeRequest(payload, attempt + 1);
-            }
-
+            recordConnection(payload.action, timedOut ? 'timed out' : 'failed', error.message);
+            if (serverRejected) throw error;
             if (!mayRetry) {
               throw new Error(
                 'The Bridge response was interrupted. The change may still ' +
@@ -701,7 +741,12 @@
               );
             }
 
+            if (timedOut) {
+              throw new Error('Connection timed out after 15 seconds. Please try again when the connection is working.');
+            }
             throw error;
+          } finally {
+            clearTimeout(deadline);
           }
         }
 

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Murata and Kanamori connection comparison</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f6f8;color:#17212b;font:17px/1.5 system-ui,sans-serif}
+main{max-width:780px;margin:24px auto;padding:24px;background:white;border-radius:16px}
+h1{font-size:26px;line-height:1.2;margin:0 0 16px}button{font:inherit;font-weight:700;padding:14px 22px;border:0;border-radius:9px;background:#24613b;color:white;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}table{border-collapse:collapse;width:100%;margin:22px 0;font-size:16px}th,td{text-align:left;vertical-align:top;border:1px solid #ccd2d8;padding:12px}th{background:#eef2f5}td[data-state="success"]{color:#135c33}td[data-state="failed"]{color:#9a2525}
+textarea{width:100%;height:220px;font:13px/1.5 monospace;padding:12px;background:#f8fafb;border:1px solid #ccd2d8;border-radius:8px}.note{font-size:15px;color:#4d5964}
+@media(max-width:600px){main{margin:0;padding:20px;border-radius:0}th,td{padding:9px;font-size:14px}h1{font-size:23px}}
+</style></head><body><main>
+<h1>Compare Murata and Kanamori</h1>
+<p>On the tablet where Murata failed, tap the button once. Keep this page open while the checks run.</p>
+<p class="note">This reads the Day list, Study cards for Day 1, and vocabulary list for Day 1. It makes no changes and displays no vocabulary. Both students are checked together at each step.</p>
+<button id="run" type="button">Run comparison</button>
+<p id="status" role="status" aria-live="polite">Ready. Three paired checks; up to 45 seconds total.</p>
+<table aria-label="Connection comparison results"><thead><tr><th>Request</th><th>Murata</th><th>Kanamori</th></tr></thead><tbody>
+<tr><th scope="row">Day list</th><td id="days-murata">—</td><td id="days-kanamori">—</td></tr>
+<tr><th scope="row">Study: Day 1</th><td id="study-murata">—</td><td id="study-kanamori">—</td></tr>
+<tr><th scope="row">Vocabulary: Day 1</th><td id="list-murata">—</td><td id="list-kanamori">—</td></tr>
+</tbody></table>
+<p class="note">Each request stops after 15 seconds. There are no automatic retries. A successful check does not establish long-term reliability.</p>
+<label for="results"><strong>Results to send back</strong></label>
+<p class="note">Send a screenshot of the table, or copy the text below.</p>
+<textarea id="results" readonly aria-label="Copyable comparison results"></textarea>
+<script>
+'use strict';
+const STUDENTS = [
+  {key:'murata',name:'Murata',url:"https://script.google.com/macros/s/AKfycbzfLohc0CeA6-lIEfUCFYe19RNHjU41NQBTuBuFli9ySAV8I4XevbPQa1Z9xNB9wqyz/exec"},
+  {key:'kanamori',name:'Kanamori',url:"https://script.google.com/macros/s/AKfycbwna8OFN4ov4MecsI4LejLTatvBWHTkCbsw_MZxDWJCoPv5qnjqtURNkGyo9B5-jT5CIw/exec"}
+];
+const DEADLINE_MS=15000;
+const runButton=document.getElementById('run');
+const status=document.getElementById('status');
+const output=document.getElementById('results');
+let lines=[];
+function addLine(line){lines.push(line);output.value=lines.join('\n');}
+function validateReply(payload,data){
+  if(!data||data.ok!==true)throw new Error(data&&data.error||'Bridge rejected request');
+  if(data.action!==payload.action)throw new Error('Wrong reply type: '+(data.action||'missing'));
+  if(payload.action==='days'){
+    if(!Array.isArray(data.days)||!data.days.every(name=>typeof name==='string'&&/^Day\s+([1-9]\d?|100)$/.test(name)))throw new Error('Invalid Day list');
+    return data.days.length;
+  }
+  if(data.sheet!==payload.sheet)throw new Error('Wrong Day in reply');
+  if(payload.action==='study'){
+    if(!Array.isArray(data.cards)||!data.cards.every(pair=>Array.isArray(pair)&&pair.length===2&&pair.every(value=>typeof value==='string')))throw new Error('Invalid Study reply');
+    return data.cards.length;
+  }
+  if(!Array.isArray(data.entries)||!data.entries.every(entry=>entry&&Number.isInteger(entry.row)&&entry.row>=2&&typeof entry.word==='string'&&typeof entry.definition==='string'))throw new Error('Invalid vocabulary reply');
+  return data.entries.length;
+}
+async function check(student,payload){
+  if(!['days','study','list'].includes(payload.action))throw new Error('Only reads are permitted');
+  const cell=document.getElementById(payload.action+'-'+student.key);
+  cell.textContent='Checking…';cell.dataset.state='';
+  const controller=new AbortController();
+  const started=Date.now();let phase='waiting for response headers';let timer;
+  const deadline=new Promise((_,reject)=>{
+    timer=setTimeout(()=>{controller.abort();reject(new Error('Timed out: '+phase));},DEADLINE_MS);
+  });
+  try{
+    const transfer=(async()=>{
+      const response=await fetch(student.url,{
+        method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
+        body:JSON.stringify(payload),cache:'no-store',signal:controller.signal
+      });
+      phase='reading response body';
+      addLine(student.name+' '+payload.action+': headers at '+((Date.now()-started)/1000).toFixed(1)+'s; HTTP '+response.status+'; redirected='+response.redirected);
+      const text=await response.text();
+      if(!response.ok)throw new Error('HTTP '+response.status);
+      phase='validating response';
+      let data;try{data=JSON.parse(text);}catch{throw new Error('Response was not JSON');}
+      return validateReply(payload,data);
+    })();
+    const count=await Promise.race([transfer,deadline]);
+    const seconds=((Date.now()-started)/1000).toFixed(1);
+    cell.textContent='OK · '+seconds+'s · '+count+' items';cell.dataset.state='success';
+    addLine(student.name+' '+payload.action+': OK '+seconds+'s; count='+count);
+    return {ok:true};
+  }catch(error){
+    const seconds=((Date.now()-started)/1000).toFixed(1);
+    cell.textContent=error.message+' ('+seconds+'s)';cell.dataset.state='failed';
+    addLine(student.name+' '+payload.action+': FAILED '+seconds+'s; '+error.message);
+    return {ok:false};
+  }finally{clearTimeout(timer);}
+}
+runButton.addEventListener('click',async()=>{
+  if(runButton.disabled)return;
+  runButton.disabled=true;lines=[];
+  addLine('Connection comparison v1');
+  addLine('Started: '+new Date().toISOString());
+  addLine('Browser: '+navigator.userAgent);
+  for(const action of ['days','study','list']){
+    for(const student of STUDENTS){const cell=document.getElementById(action+'-'+student.key);cell.textContent='—';cell.dataset.state='';}
+  }
+  let failures=0;
+  try{
+    for(const action of ['days','study','list']){
+      status.textContent='Checking '+(action==='days'?'Day lists':action==='study'?'Study for Day 1':'vocabulary lists for Day 1')+'…';
+      const payload=action==='days'?{action}:{action,sheet:'Day 1'};
+      const pair=await Promise.all(STUDENTS.map(student=>check(student,payload)));
+      failures+=pair.filter(result=>!result.ok).length;
+    }
+    status.textContent='Comparison complete: '+failures+' failed request'+(failures===1?'':'s')+'. Please send the results.';
+    addLine('Completed: '+new Date().toISOString());
+  }catch(error){status.textContent='Comparison stopped: '+error.message;}
+  finally{runButton.disabled=false;}
+});
+</script></main></body></html>
